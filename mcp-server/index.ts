@@ -47,30 +47,41 @@ function detectProjectName(): string | undefined {
   if (process.env.SHODH_PROJECT_ID) return process.env.SHODH_PROJECT_ID;
 
   // Priority 2: Git remote origin (worktree-safe)
+  // Read .git/config directly to avoid execSync sandbox issues
   try {
-    const { execSync } = require("child_process");
+    const fs = require("fs");
+    const path = require("path");
     const dir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-    // Use common full paths since MCP subprocesses may have a stripped PATH
-    const gitPaths = ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git", "git"];
-    let gitBin = "git";
-    for (const p of gitPaths) {
-      try { execSync(`${p} --version`, { encoding: "utf-8", timeout: 1000, stdio: "pipe" }); gitBin = p; break; } catch { /* try next */ }
-    }
-    const remoteUrl = execSync(`${gitBin} config --get remote.origin.url`, {
-      cwd: dir,
-      encoding: "utf-8",
-      timeout: 3000,
-      stdio: "pipe",
-    }).trim();
-    if (remoteUrl) {
+
+    // Find .git - could be a directory (normal) or file (worktree)
+    let gitDir = path.join(dir, ".git");
+    try {
+      const stat = fs.statSync(gitDir);
+      if (!stat.isDirectory()) {
+        // Worktree: .git is a file containing "gitdir: /path/to/main/.git/worktrees/name"
+        const content = fs.readFileSync(gitDir, "utf-8").trim();
+        const match = content.match(/^gitdir:\s*(.+)/);
+        if (match) {
+          // Resolve to the main repo's .git dir (go up from worktrees/name)
+          gitDir = path.resolve(dir, match[1], "..", "..");
+        }
+      }
+    } catch { /* .git doesn't exist */ }
+
+    const configPath = path.join(gitDir, "config");
+    const configContent = fs.readFileSync(configPath, "utf-8");
+    // Parse [remote "origin"] section for url =
+    const originMatch = configContent.match(/\[remote "origin"\][^\[]*?url\s*=\s*(.+)/);
+    if (originMatch) {
+      const remoteUrl = originMatch[1].trim();
       // Extract repo name from URL:
       // https://github.com/org/repo.git → repo
       // git@github.com:org/repo.git → repo
-      const match = remoteUrl.match(/[/:]([^/:]+?)(?:\.git)?$/);
-      if (match) return match[1];
+      const repoMatch = remoteUrl.match(/[/:]([^/:]+?)(?:\.git)?$/);
+      if (repoMatch) return repoMatch[1];
     }
   } catch (e: any) {
-    console.error(`[shodh-memory] Git detection failed: ${e?.message?.split('\n')[0] || e}`);
+    console.error(`[shodh-memory] Git config read failed: ${e?.message?.split('\n')[0] || e}`);
   }
 
   // Priority 3: Directory basename
@@ -80,7 +91,9 @@ function detectProjectName(): string | undefined {
 
 const PROJECT_NAME = detectProjectName();
 if (PROJECT_SCOPING) {
-  console.error(`[shodh-memory] Project scoping: ${PROJECT_NAME ? `"${PROJECT_NAME}"` : "detection failed"} (cwd: ${process.cwd()}, CLAUDE_PROJECT_DIR: ${process.env.CLAUDE_PROJECT_DIR || "unset"})`);
+  const debugMsg = `[shodh-memory] Project scoping: ${PROJECT_NAME ? `"${PROJECT_NAME}"` : "detection failed"} (cwd: ${process.cwd()}, CLAUDE_PROJECT_DIR: ${process.env.CLAUDE_PROJECT_DIR || "unset"})`;
+  console.error(debugMsg);
+  try { require("fs").appendFileSync("/tmp/shodh-mcp-debug.log", debugMsg + "\n"); } catch {}
 }
 
 // Detect whether the server is local (safe for auto-generated keys)
