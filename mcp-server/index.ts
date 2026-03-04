@@ -62,8 +62,8 @@ function detectProjectName(): string | undefined {
       const match = remoteUrl.match(/[/:]([^/:]+?)(?:\.git)?$/);
       if (match) return match[1];
     }
-  } catch {
-    // Not a git repo or git not available — fall through
+  } catch (e: any) {
+    console.error(`[shodh-memory] Git detection failed: ${e?.message?.split('\n')[0] || e}`);
   }
 
   // Priority 3: Directory basename
@@ -72,8 +72,8 @@ function detectProjectName(): string | undefined {
 }
 
 const PROJECT_NAME = detectProjectName();
-if (PROJECT_NAME) {
-  console.error(`[shodh-memory] Project scoping enabled: "${PROJECT_NAME}"`);
+if (PROJECT_SCOPING) {
+  console.error(`[shodh-memory] Project scoping: ${PROJECT_NAME ? `"${PROJECT_NAME}"` : "detection failed"} (cwd: ${process.cwd()}, CLAUDE_PROJECT_DIR: ${process.env.CLAUDE_PROJECT_DIR || "unset"})`);
 }
 
 // Detect whether the server is local (safe for auto-generated keys)
@@ -3219,6 +3219,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: string;
             experience_type: string;
             entities?: string[];
+            context?: {
+              project?: {
+                project_id?: string;
+                name?: string;
+              };
+            };
           };
           importance: number;
           created_at: string;
@@ -3254,6 +3260,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `Type: ${memory.experience.experience_type} | Tags: ${tags}\n`;
         response += `Tier: ${memory.tier || 'Unknown'} | Created: ${created} | Importance: ${(memory.importance * 100).toFixed(0)}%\n`;
+
+        // Project context
+        const projectName = memory.experience.context?.project?.name || memory.experience.context?.project?.project_id;
+        if (projectName) {
+          response += `Project: ${projectName}\n`;
+        }
 
         // Hierarchy info
         if (memory.parent_id) {
