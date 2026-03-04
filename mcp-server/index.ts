@@ -50,10 +50,17 @@ function detectProjectName(): string | undefined {
   try {
     const { execSync } = require("child_process");
     const dir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-    const remoteUrl = execSync("git config --get remote.origin.url", {
+    // Use common full paths since MCP subprocesses may have a stripped PATH
+    const gitPaths = ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git", "git"];
+    let gitBin = "git";
+    for (const p of gitPaths) {
+      try { execSync(`${p} --version`, { encoding: "utf-8", timeout: 1000, stdio: "pipe" }); gitBin = p; break; } catch { /* try next */ }
+    }
+    const remoteUrl = execSync(`${gitBin} config --get remote.origin.url`, {
       cwd: dir,
       encoding: "utf-8",
       timeout: 3000,
+      stdio: "pipe",
     }).trim();
     if (remoteUrl) {
       // Extract repo name from URL:
