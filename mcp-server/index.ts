@@ -1483,6 +1483,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           response += ` │ Tags: ${tags.join(', ')}`;
         }
         response += `\nID: ${result.id}`;
+        if (PROJECT_NAME) {
+          response += ` │ Project: ${PROJECT_NAME}`;
+        }
 
         return {
           content: [{ type: "text", text: response }],
