@@ -333,6 +333,7 @@ pub async fn recall(
     let memory_for_recall = memory.clone();
     let user_id_for_recall = req.user_id.clone();
     let query_for_recall = req.query.clone();
+    let project_for_recall = req.project.clone();
 
     let (memories, triggered_reminders, _prospective_signals) =
         tokio::task::spawn_blocking(move || {
@@ -408,6 +409,7 @@ pub async fn recall(
                 max_results: limit,
                 retrieval_mode: retrieval_mode_for_recall,
                 prospective_signals: prospective_signals.clone(),
+                project_id: project_for_recall,
                 ..Default::default()
             };
 
