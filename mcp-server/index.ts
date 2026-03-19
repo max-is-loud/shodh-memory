@@ -49,8 +49,6 @@ function detectProjectName(): string | undefined {
   // Priority 2: Git remote origin (worktree-safe)
   // Read .git/config directly to avoid execSync sandbox issues
   try {
-    const fs = require("fs");
-    const path = require("path");
     const dir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 
     // Find .git - could be a directory (normal) or file (worktree)
