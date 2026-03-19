@@ -157,6 +157,8 @@ pub struct ProactiveSurfacedMemory {
     /// Entities from this memory that matched the query context
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub matched_entities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     /// Embedding for semantic feedback (not serialized to response)
     #[serde(skip)]
     pub embedding: Vec<f32>,
@@ -432,6 +434,8 @@ pub async fn recall(
                     content: m.experience.content.clone(),
                     memory_type: Some(format!("{:?}", m.experience.experience_type)),
                     tags: m.experience.entities.clone(),
+                    project: m.experience.context.as_ref()
+                        .and_then(|c| c.project.project_id.clone()),
                 },
                 importance: m.importance(),
                 created_at: m.created_at.to_rfc3339(),
@@ -1460,6 +1464,8 @@ pub async fn proactive_context(
                         tier: format!("{:?}", m.tier),
                         relevance_reason,
                         matched_entities: matched,
+                        project: m.experience.context.as_ref()
+                            .and_then(|c| c.project.project_id.clone()),
                         embedding: m.experience.embeddings.clone().unwrap_or_default(),
                     }
                 })
@@ -2218,6 +2224,8 @@ pub async fn recall_tracked(
                     content: m.experience.content.clone(),
                     memory_type: Some(format!("{:?}", m.experience.experience_type)),
                     tags: m.experience.entities.clone(),
+                    project: m.experience.context.as_ref()
+                        .and_then(|c| c.project.project_id.clone()),
                 },
                 importance: m.importance(),
                 created_at: m.created_at.to_rfc3339(),

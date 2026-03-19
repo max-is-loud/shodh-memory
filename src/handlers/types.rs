@@ -248,6 +248,8 @@ pub struct RecallExperience {
     pub content: String,
     pub memory_type: Option<String>,
     pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 // =============================================================================
