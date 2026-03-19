@@ -1059,8 +1059,14 @@ impl GraphMemory {
             .expect("stemmed_index CF must exist")
     }
 
-    /// Create a new graph memory system
-    pub fn new(path: &Path) -> Result<Self> {
+    /// Create a new graph memory system.
+    ///
+    /// If `shared_cache` is provided, block-cache reads are charged against the
+    /// shared LRU cache (recommended for multi-tenant server mode). When `None`,
+    /// a small per-instance cache is created (standalone / test use).
+    pub fn new(path: &Path, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
+        use crate::constants::ROCKSDB_GRAPH_WRITE_BUFFER_BYTES;
+
         let graph_path = path.join("graph");
         std::fs::create_dir_all(&graph_path)?;
 
@@ -1068,14 +1074,21 @@ impl GraphMemory {
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        opts.set_write_buffer_size(16 * 1024 * 1024); // 16MB — graph entries are small KV pairs
+        opts.set_write_buffer_size(ROCKSDB_GRAPH_WRITE_BUFFER_BYTES);
         opts.set_max_write_buffer_number(2);
 
-        // Bounded block cache prevents unbounded C++ heap growth during full scans.
-        // 32MB is sufficient for the graph DB (entities + edges are small KV pairs).
+        // Shared block cache for multi-tenant, small local for standalone/tests.
         use rocksdb::{BlockBasedOptions, Cache};
         let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(&Cache::new_lru_cache(32 * 1024 * 1024));
+        let local_cache;
+        let cache = match shared_cache {
+            Some(c) => c,
+            None => {
+                local_cache = Cache::new_lru_cache(8 * 1024 * 1024); // 8MB standalone
+                &local_cache
+            }
+        };
+        block_opts.set_block_cache(cache);
         block_opts.set_cache_index_and_filter_blocks(true);
         opts.set_block_based_table_factory(&block_opts);
 
@@ -3359,7 +3372,16 @@ impl GraphMemory {
     }
 
     /// Invalidate a relationship (temporal edge invalidation)
+    ///
+    /// Guarded by synapse_update_lock to prevent race with strengthen/decay.
     pub fn invalidate_relationship(&self, edge_uuid: &Uuid) -> Result<()> {
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| {
+                anyhow::anyhow!("synapse_update_lock timeout in invalidate_relationship")
+            })?;
+
         if let Some(mut edge) = self.get_relationship(edge_uuid)? {
             edge.invalidated_at = Some(Utc::now());
 
@@ -3378,8 +3400,11 @@ impl GraphMemory {
     ///
     /// Uses a mutex to prevent race conditions during concurrent updates (SHO-64).
     pub fn strengthen_synapse(&self, edge_uuid: &Uuid) -> Result<()> {
-        // Lock to prevent concurrent read-modify-write race conditions
-        let _guard = self.synapse_update_lock.lock();
+        // Lock with timeout to prevent deadlock on panic
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| anyhow::anyhow!("synapse_update_lock timeout in strengthen_synapse"))?;
 
         if let Some(mut edge) = self.get_relationship(edge_uuid)? {
             let _ = edge.strengthen();
@@ -3403,8 +3428,13 @@ impl GraphMemory {
             return Ok(0);
         }
 
-        // Single lock acquisition for entire batch
-        let _guard = self.synapse_update_lock.lock();
+        // Single lock acquisition for entire batch, with timeout
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| {
+                anyhow::anyhow!("synapse_update_lock timeout in batch_strengthen_synapses")
+            })?;
 
         // Batch read all edges in a single RocksDB call (same pattern as get_entity_relationships_limited)
         let keys: Vec<[u8; 16]> = edge_uuids.iter().map(|u| *u.as_bytes()).collect();
@@ -3465,7 +3495,12 @@ impl GraphMemory {
             return Ok(0);
         }
 
-        let _guard = self.synapse_update_lock.lock();
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| {
+                anyhow::anyhow!("synapse_update_lock timeout in record_memory_coactivation")
+            })?;
         let mut batch = WriteBatch::default();
         let mut edges_updated = 0;
         let mut new_edges = 0;
@@ -3601,7 +3636,12 @@ impl GraphMemory {
             return Ok((0, Vec::new()));
         }
 
-        let _guard = self.synapse_update_lock.lock();
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| {
+                anyhow::anyhow!("synapse_update_lock timeout in strengthen_edges_from_boosts")
+            })?;
         let mut batch = WriteBatch::default();
         let mut strengthened = 0;
         let mut promotion_boosts = Vec::new();
@@ -3833,7 +3873,12 @@ impl GraphMemory {
             return Ok(0);
         }
 
-        let _guard = self.synapse_update_lock.lock();
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| {
+                anyhow::anyhow!("synapse_update_lock timeout in strengthen_episode_entity_edges")
+            })?;
         let mut batch = WriteBatch::default();
         let mut strengthened = 0;
 
@@ -3952,7 +3997,10 @@ impl GraphMemory {
     /// Uses a mutex to prevent race conditions during concurrent updates (SHO-64).
     pub fn decay_synapse(&self, edge_uuid: &Uuid) -> Result<bool> {
         // Lock to prevent concurrent read-modify-write race conditions
-        let _guard = self.synapse_update_lock.lock();
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| anyhow::anyhow!("synapse_update_lock timeout in decay_synapse"))?;
 
         if let Some(mut edge) = self.get_relationship(edge_uuid)? {
             let should_prune = edge.decay();
@@ -3975,8 +4023,13 @@ impl GraphMemory {
             return Ok(Vec::new());
         }
 
-        // Single lock acquisition for entire batch
-        let _guard = self.synapse_update_lock.lock();
+        // Single lock acquisition for entire batch, with timeout
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| {
+                anyhow::anyhow!("synapse_update_lock timeout in batch_decay_synapses")
+            })?;
 
         let mut batch = WriteBatch::default();
         let mut to_prune = Vec::new();
@@ -4016,7 +4069,12 @@ impl GraphMemory {
             return Ok(Vec::new());
         }
 
-        let _guard = self.synapse_update_lock.lock();
+        let _guard = self
+            .synapse_update_lock
+            .try_lock_for(std::time::Duration::from_secs(5))
+            .ok_or_else(|| {
+                anyhow::anyhow!("synapse_update_lock timeout in batch_decay_edges_in_place")
+            })?;
         let mut batch = WriteBatch::default();
         let mut to_prune = Vec::new();
 
@@ -6287,7 +6345,7 @@ mod tests {
     fn test_hebbian_strength_no_episode() {
         // Create a temporary graph memory for testing
         let temp_dir = tempfile::tempdir().unwrap();
-        let graph = GraphMemory::new(temp_dir.path()).unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
 
         // Random memory ID with no associated episode should return 0.5 (neutral)
         let fake_memory_id = crate::memory::MemoryId(Uuid::new_v4());
@@ -6298,7 +6356,7 @@ mod tests {
     #[test]
     fn test_hebbian_strength_with_episode_no_edges() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let graph = GraphMemory::new(temp_dir.path()).unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
 
         // Create entities
         let entity1 = EntityNode {
@@ -6357,7 +6415,7 @@ mod tests {
     #[test]
     fn test_hebbian_strength_with_edges() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let graph = GraphMemory::new(temp_dir.path()).unwrap();
+        let graph = GraphMemory::new(temp_dir.path(), None).unwrap();
 
         // Create entities
         let entity1_uuid = Uuid::new_v4();

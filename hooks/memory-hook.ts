@@ -121,7 +121,7 @@ async function callBrain(endpoint: string, body: Record<string, unknown>): Promi
   }
 }
 
-function formatRelativeTime(isoDate: string): string {
+export function formatRelativeTime(isoDate: string): string {
   const d = new Date(isoDate);
   const now = new Date();
   const diffMs = now.getTime() - d.getTime();
@@ -133,7 +133,7 @@ function formatRelativeTime(isoDate: string): string {
   return d.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-function formatMemoriesForContext(memories: SurfacedMemory[]): string {
+export function formatMemoriesForContext(memories: SurfacedMemory[]): string {
   if (!memories.length) return "";
 
   return memories
@@ -143,6 +143,31 @@ function formatMemoriesForContext(memories: SurfacedMemory[]): string {
       return `• [${score}%] (${time}) ${m.content.slice(0, 120)}${m.content.length > 120 ? "..." : ""}`;
     })
     .join("\n");
+}
+
+export function isErrorOutput(toolOutput: string): boolean {
+  return (
+    toolOutput.includes("error") ||
+    toolOutput.includes("Error") ||
+    toolOutput.includes("failed") ||
+    toolOutput.includes("FAILED")
+  );
+}
+
+export function buildPreToolContext(toolName: string, toolInput: Record<string, unknown>): string {
+  if (toolName === "Edit" || toolName === "Write") {
+    const filePath = toolInput.file_path as string;
+    if (filePath) {
+      return `Editing file: ${filePath}`;
+    }
+  } else if (toolName === "Bash") {
+    const command = toolInput.command as string;
+    if (command) {
+      return `Running command: ${command.slice(0, 100)}`;
+    }
+  }
+
+  return `About to use ${toolName}`;
 }
 
 async function surfaceProactiveContext(context: string, maxResults = 3, autoIngest = false, project?: string): Promise<string | null> {
@@ -240,20 +265,7 @@ async function handlePreToolUse(input: HookInput): Promise<void> {
   const toolInput = input.tool_input;
   if (!toolName || !toolInput) return;
 
-  // Build context from tool input
-  let context = `About to use ${toolName}`;
-
-  if (toolName === "Edit" || toolName === "Write") {
-    const filePath = toolInput.file_path as string;
-    if (filePath) {
-      context = `Editing file: ${filePath}`;
-    }
-  } else if (toolName === "Bash") {
-    const command = toolInput.command as string;
-    if (command) {
-      context = `Running command: ${command.slice(0, 100)}`;
-    }
-  }
+  const context = buildPreToolContext(toolName, toolInput);
 
   // Surface relevant context BEFORE the tool runs
   const memoryContext = await surfaceProactiveContext(context, 2, false, hookProject);
@@ -299,12 +311,7 @@ async function handlePostToolUse(input: HookInput): Promise<void> {
     const command = toolInput?.command as string;
 
     // Store errors/failures for learning
-    if (
-      toolOutput.includes("error") ||
-      toolOutput.includes("Error") ||
-      toolOutput.includes("failed") ||
-      toolOutput.includes("FAILED")
-    ) {
+    if (isErrorOutput(toolOutput)) {
       await callBrain("/api/remember", {
         user_id: SHODH_USER_ID,
         content: `Command failed: ${command?.slice(0, 100)} → ${toolOutput.slice(0, 200)}`,
@@ -587,8 +594,10 @@ async function main(): Promise<void> {
   }
 }
 
-try {
-  await main();
-} catch {
-  // Silent — hooks must not crash Claude Code
+if (import.meta.main) {
+  try {
+    await main();
+  } catch {
+    // Silent — hooks must not crash Claude Code
+  }
 }

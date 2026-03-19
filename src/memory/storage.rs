@@ -726,6 +726,35 @@ impl LegacyMemoryFlatV2 {
 /// Returns (Memory, is_legacy) where is_legacy=true means the data was in an old format
 /// and should be re-written to current format for future performance.
 fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
+    fn record_branch(branch: &str) {
+        crate::metrics::LEGACY_FALLBACK_BRANCH_TOTAL
+            .with_label_values(&[branch])
+            .inc();
+    }
+
+    // Try current format first (bincode 2.x with current Memory/Experience)
+    // This is the hot path — avoid any allocations before this check.
+    match bincode::serde::decode_from_slice::<Memory, _>(data, bincode::config::standard()) {
+        Ok((memory, _)) => {
+            return Ok((memory, false));
+        } // Current format, no migration needed
+        Err(e) => {
+            // Current format failed — enter fallback chain.
+            // From here on we collect errors for diagnostics.
+            return deserialize_legacy_fallback(data, e, record_branch);
+        }
+    }
+}
+
+/// Fallback deserialization chain for legacy memory formats.
+///
+/// Separated from `deserialize_with_fallback` so the hot path (current format)
+/// stays allocation-free and the compiler can inline/optimize it independently.
+fn deserialize_legacy_fallback(
+    data: &[u8],
+    first_error: bincode::error::DecodeError,
+    record_branch: fn(&str),
+) -> Result<(Memory, bool)> {
     // Log detailed errors for first entry only to help debug format issues
     static DEBUG_ENTRY_LOGGED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -733,18 +762,14 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
 
     // Collect all errors for debugging
     let mut errors: Vec<(&str, String)> = Vec::new();
-
-    // Try current format first (bincode 2.x with current Memory/Experience)
-    match bincode::serde::decode_from_slice::<Memory, _>(data, bincode::config::standard()) {
-        Ok((memory, _)) => return Ok((memory, false)), // Current format, no migration needed
-        Err(e) => errors.push(("bincode2 Memory", e.to_string())),
-    }
+    errors.push(("bincode2 Memory", first_error.to_string()));
 
     // Try bincode 2.x MINIMAL format (just UUID + content string)
     // This matches the hex pattern: 16-byte UUID + varint length + string bytes
     match bincode::serde::decode_from_slice::<MinimalMemory, _>(data, bincode::config::standard()) {
         Ok((minimal, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x minimal format");
+            record_branch("bincode2_minimal");
             return Ok((minimal.into_memory(), true));
         }
         Err(e) => errors.push(("bincode2 MinimalMemory", e.to_string())),
@@ -758,6 +783,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     ) {
         Ok((typed, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x with type prefix");
+            record_branch("bincode2_type_prefix");
             return Ok((typed.into_memory(), true));
         }
         Err(e) => errors.push(("bincode2 MemoryWithTypePrefix", e.to_string())),
@@ -770,6 +796,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     ) {
         Ok((legacy, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x pre-multimodal format");
+            record_branch("bincode2_legacy_flat_v2");
             return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode2 LegacyMemoryFlatV2", e.to_string())),
@@ -779,6 +806,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     match bincode1::deserialize::<LegacyMemoryV1>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x v0.1.0 format");
+            record_branch("bincode1_legacy_v1");
             return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 LegacyMemoryV1", e.to_string())),
@@ -788,6 +816,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     match bincode1::deserialize::<MinimalMemory>(data) {
         Ok(minimal) => {
             tracing::debug!("Migrated memory from bincode 1.x minimal format");
+            record_branch("bincode1_minimal");
             return Ok((minimal.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 MinimalMemory", e.to_string())),
@@ -797,6 +826,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     match bincode1::deserialize::<SimpleLegacyMemory>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x simple format");
+            record_branch("bincode1_simple");
             return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 SimpleLegacyMemory", e.to_string())),
@@ -812,6 +842,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     match fixint_config.deserialize::<MinimalMemory>(data) {
         Ok(minimal) => {
             tracing::debug!("Migrated memory from bincode 1.x fixint minimal format");
+            record_branch("bincode1_fixint_minimal");
             return Ok((minimal.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 fixint MinimalMemory", e.to_string())),
@@ -820,6 +851,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     match fixint_config.deserialize::<SimpleLegacyMemory>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x fixint simple format");
+            record_branch("bincode1_fixint_simple");
             return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 fixint SimpleLegacyMemory", e.to_string())),
@@ -829,6 +861,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     match rmp_serde::from_slice::<MinimalMemory>(data) {
         Ok(minimal) => {
             tracing::debug!("Migrated memory from MessagePack minimal format");
+            record_branch("msgpack_minimal");
             return Ok((minimal.into_memory(), true));
         }
         Err(e) => errors.push(("msgpack MinimalMemory", e.to_string())),
@@ -838,6 +871,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     match rmp_serde::from_slice::<SimpleLegacyMemory>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from MessagePack simple format");
+            record_branch("msgpack_simple");
             return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("msgpack SimpleLegacyMemory", e.to_string())),
@@ -847,6 +881,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     match bincode1::deserialize::<LegacyMemoryV1Full>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x v1 full format");
+            record_branch("bincode1_legacy_v1_full");
             return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 LegacyMemoryV1Full", e.to_string())),
@@ -856,6 +891,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     match fixint_config.deserialize::<LegacyMemoryV1Full>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x fixint v1 full format");
+            record_branch("bincode1_fixint_legacy_v1_full");
             return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 fixint LegacyMemoryV1Full", e.to_string())),
@@ -865,6 +901,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     match rmp_serde::from_slice::<LegacyMemoryV1Full>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from MessagePack v1 full format");
+            record_branch("msgpack_legacy_v1_full");
             return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("msgpack LegacyMemoryV1Full", e.to_string())),
@@ -874,6 +911,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     match bincode1::deserialize::<LegacyMemoryV1>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x format");
+            record_branch("bincode1_legacy_v1_repeat");
             return Ok((legacy.into_memory(), true));
         }
         Err(_) => {} // Already tried above
@@ -883,6 +921,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     match bincode1::deserialize::<LegacyMemoryV2>(data) {
         Ok(legacy) => {
             tracing::debug!("Migrated memory from bincode 1.x v2 format");
+            record_branch("bincode1_legacy_v2");
             return Ok((legacy.into_memory(), true));
         }
         Err(e) => errors.push(("bincode1 LegacyMemoryV2", e.to_string())),
@@ -896,6 +935,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     ) {
         Ok((mem, _)) => {
             tracing::debug!("Migrated memory from bincode 2.x with 3-byte header");
+            record_branch("bincode2_3byte_header");
             return Ok((mem.into_memory(), true));
         }
         Err(e) => errors.push(("bincode2 MemoryWith3ByteHeader", e.to_string())),
@@ -904,6 +944,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     // LAST RESORT: Try raw byte parsing with different header skip sizes
     // This handles non-standard formats by finding where valid UTF-8 content starts
     if let Some(memory) = try_raw_memory_parse(data) {
+        record_branch("raw_parse");
         return Ok((memory, true));
     }
     errors.push(("raw parse", "no valid UTF-8 content found".to_string()));
@@ -926,6 +967,7 @@ fn deserialize_with_fallback(data: &[u8]) -> Result<(Memory, bool)> {
     }
 
     // All formats failed
+    record_branch("decode_failed");
     Err(anyhow!(
         "Failed to deserialize memory: incompatible format ({} bytes)",
         data.len()
@@ -972,7 +1014,14 @@ impl MemoryStorage {
             .expect("memory_index CF must exist")
     }
 
-    pub fn new(path: &Path) -> Result<Self> {
+    /// Create a new memory storage.
+    ///
+    /// If `shared_cache` is provided, all block-cache reads are charged against
+    /// the shared LRU cache (recommended for multi-tenant server mode). When
+    /// `None`, a small per-instance cache is created (standalone / test use).
+    pub fn new(path: &Path, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
+        use crate::constants::ROCKSDB_MEMORY_WRITE_BUFFER_BYTES;
+
         // Create directories if they don't exist
         let storage_path = path.join("storage");
         std::fs::create_dir_all(&storage_path)?;
@@ -999,18 +1048,26 @@ impl MemoryStorage {
 
         // Write performance — sized for edge deployment (tune up via env for heavy workloads)
         opts.set_max_write_buffer_number(2);
-        opts.set_write_buffer_size(32 * 1024 * 1024); // 32MB write buffer
+        opts.set_write_buffer_size(ROCKSDB_MEMORY_WRITE_BUFFER_BYTES);
         opts.set_level_zero_file_num_compaction_trigger(4);
         opts.set_target_file_size_base(64 * 1024 * 1024); // 64MB SST files
         opts.set_max_bytes_for_level_base(256 * 1024 * 1024); // 256MB L1
         opts.set_max_background_jobs(4);
         opts.set_level_compaction_dynamic_level_bytes(true);
 
-        // Read performance — 64MB block cache covers ~16K blocks, ample for edge use
+        // Read performance — shared block cache for multi-tenant, small local for standalone
         use rocksdb::{BlockBasedOptions, Cache};
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_bloom_filter(10.0, false); // 10 bits/key = ~1% FPR
-        block_opts.set_block_cache(&Cache::new_lru_cache(64 * 1024 * 1024)); // 64MB cache
+        let local_cache;
+        let cache = match shared_cache {
+            Some(c) => c,
+            None => {
+                local_cache = Cache::new_lru_cache(16 * 1024 * 1024); // 16MB standalone
+                &local_cache
+            }
+        };
+        block_opts.set_block_cache(cache);
         block_opts.set_cache_index_and_filter_blocks(true);
         block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true); // Pin L0 for fast reads
         opts.set_block_based_table_factory(&block_opts);
@@ -1025,7 +1082,7 @@ impl MemoryStorage {
                     idx_opts.create_if_missing(true);
                     idx_opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
                     idx_opts.set_max_write_buffer_number(2);
-                    idx_opts.set_write_buffer_size(32 * 1024 * 1024);
+                    idx_opts.set_write_buffer_size(ROCKSDB_MEMORY_WRITE_BUFFER_BYTES);
                     idx_opts
                 }),
             ]
@@ -1142,6 +1199,9 @@ impl MemoryStorage {
                     tracing::info!("  memories: migrated {count} entries to default CF");
 
                     let backup_name = base_path.join("memories.pre_cf_migration");
+                    if backup_name.exists() {
+                        let _ = std::fs::remove_dir_all(&backup_name);
+                    }
                     if let Err(e) = std::fs::rename(&old_memories_dir, &backup_name) {
                         tracing::warn!("Could not rename old memories dir: {e}");
                     }
@@ -1181,6 +1241,9 @@ impl MemoryStorage {
                     tracing::info!("  index: migrated {count} entries to {CF_INDEX} CF");
 
                     let backup_name = base_path.join("memory_index.pre_cf_migration");
+                    if backup_name.exists() {
+                        let _ = std::fs::remove_dir_all(&backup_name);
+                    }
                     if let Err(e) = std::fs::rename(&old_index_dir, &backup_name) {
                         tracing::warn!("Could not rename old memory_index dir: {e}");
                     }
@@ -1347,6 +1410,16 @@ impl MemoryStorage {
             batch.put_cf(idx, reward_key.as_bytes(), b"1");
         }
 
+        // === Content Hash Index (idempotency) ===
+        // Index by SHA256 content hash for dedup (issue #109)
+        // Key format: content_hash:{hex} -> memory_id (16 bytes UUID)
+        // Enables O(1) duplicate detection on remember()
+        {
+            let content_hash = Self::sha256_content_hash(&memory.experience.content);
+            let hash_key = format!("content_hash:{}", content_hash);
+            batch.put_cf(idx, hash_key.as_bytes(), memory.id.0.as_bytes());
+        }
+
         // === External Linking Index ===
         // Index by external_id for upsert operations (Linear, GitHub, etc.)
         // Key format: external:{source}:{id}:{memory_id} -> memory_id
@@ -1371,6 +1444,38 @@ impl MemoryStorage {
         write_opts.set_sync(self.write_mode == WriteMode::Sync);
         self.db.write_opt(batch, &write_opts)?;
         Ok(())
+    }
+
+    /// Compute SHA256 hex digest for content dedup indexing (issue #109)
+    fn sha256_content_hash(content: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    /// Look up an existing memory by content hash (idempotency dedup, issue #109).
+    /// Returns the MemoryId if identical content was already stored.
+    pub fn get_by_content_hash(&self, content: &str) -> Option<MemoryId> {
+        let content_hash = Self::sha256_content_hash(content);
+        let hash_key = format!("content_hash:{}", content_hash);
+        let idx = self.index_cf();
+        match self.db.get_cf(idx, hash_key.as_bytes()) {
+            Ok(Some(value)) if value.len() == 16 => {
+                let uuid = uuid::Uuid::from_slice(&value).ok()?;
+                // Verify the memory still exists (might have been deleted)
+                let memory_id = MemoryId(uuid);
+                match self.get(&memory_id) {
+                    Ok(_) => Some(memory_id),
+                    Err(_) => {
+                        // Stale index entry — memory was deleted, clean up
+                        let _ = self.db.delete_cf(idx, hash_key.as_bytes());
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Retrieve a memory by ID
@@ -1567,6 +1672,13 @@ impl MemoryStorage {
             let reward_bucket = ((clamped_reward + 1.0) * 10.0) as i32;
             let reward_key = format!("reward:{}:{}", reward_bucket, id.0);
             batch.delete_cf(idx, reward_key.as_bytes());
+        }
+
+        // Content hash index (idempotency dedup)
+        {
+            let content_hash = Self::sha256_content_hash(&memory.experience.content);
+            let hash_key = format!("content_hash:{}", content_hash);
+            batch.delete_cf(idx, hash_key.as_bytes());
         }
 
         // External linking index
@@ -3418,6 +3530,105 @@ impl MemoryStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct LegacyMinimalFixture {
+        id: MemoryId,
+        content: String,
+    }
+
+    fn sample_memory(id: MemoryId, content: &str) -> Memory {
+        let now = Utc::now();
+        let experience = Experience {
+            experience_type: ExperienceType::Observation,
+            content: content.to_string(),
+            ..Default::default()
+        };
+        Memory::from_legacy(
+            id,
+            experience,
+            0.5,
+            0,
+            now,
+            now,
+            false,
+            MemoryTier::LongTerm,
+            Vec::new(),
+            1.0,
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            None,
+            None,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn test_deserialize_with_fallback_records_current_bincode2_branch() {
+        let id = MemoryId(uuid::Uuid::new_v4());
+        let memory = sample_memory(id.clone(), "current format memory");
+        let bytes = bincode::serde::encode_to_vec(&memory, bincode::config::standard()).unwrap();
+
+        let counter =
+            crate::metrics::LEGACY_FALLBACK_BRANCH_TOTAL.with_label_values(&["bincode2_memory"]);
+        let before = counter.get();
+
+        let (decoded, is_legacy) = deserialize_with_fallback(&bytes).unwrap();
+        let after = counter.get();
+
+        assert_eq!(decoded.id, id);
+        assert!(!is_legacy);
+        // Current format is not a fallback — metric should NOT increment
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn test_deserialize_with_fallback_bincode1_minimal_fixture() {
+        let id = MemoryId(uuid::Uuid::new_v4());
+        let fixture = LegacyMinimalFixture {
+            id: id.clone(),
+            content: "legacy bincode1 minimal".to_string(),
+        };
+        let bytes = bincode1::serialize(&fixture).unwrap();
+
+        let counter =
+            crate::metrics::LEGACY_FALLBACK_BRANCH_TOTAL.with_label_values(&["bincode1_minimal"]);
+        let before = counter.get();
+
+        let (decoded, is_legacy) = deserialize_with_fallback(&bytes).unwrap();
+        let after = counter.get();
+
+        assert_eq!(decoded.id, id);
+        assert!(is_legacy);
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn test_deserialize_with_fallback_msgpack_minimal_fixture() {
+        let id = MemoryId(uuid::Uuid::new_v4());
+        let fixture = LegacyMinimalFixture {
+            id: id.clone(),
+            content: "legacy msgpack minimal".to_string(),
+        };
+        let bytes = rmp_serde::to_vec(&fixture).unwrap();
+
+        let counter =
+            crate::metrics::LEGACY_FALLBACK_BRANCH_TOTAL.with_label_values(&["msgpack_minimal"]);
+        let before = counter.get();
+
+        let (decoded, is_legacy) = deserialize_with_fallback(&bytes).unwrap();
+        let after = counter.get();
+
+        assert_eq!(decoded.id, id);
+        assert!(is_legacy);
+        assert_eq!(after, before + 1);
+    }
 
     #[test]
     fn test_write_mode_default_async() {

@@ -28,6 +28,9 @@ import * as path from "path";
 import * as fs from "fs";
 import * as crypto from "crypto";
 import { fileURLToPath } from "url";
+import { nextReconnectDelay, serializeAndValidateBody, shouldWarnInsecureApiUrl } from "./security-utils";
+import { stripSystemNoise as _stripSystemNoise, getContent as _getContent, getType as _getType, formatSurfacedMemories as _formatSurfacedMemories, formatToolCallContent } from "./string-utils";
+import { TokenTracker } from "./token-tracking";
 
 const __filename = (typeof import.meta !== "undefined" && import.meta.url) ? fileURLToPath(import.meta.url) : "";
 const __dirname = __filename ? path.dirname(__filename) : process.cwd();
@@ -130,6 +133,16 @@ if (!API_KEY) {
 const RETRY_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 1000;
 const REQUEST_TIMEOUT_MS = 10000;
+// Write operations (POST/PUT/DELETE) get a longer timeout because the server
+// persists data before post-processing (graph, lineage, temporal facts).
+// Issue #109: 10s was too short, causing retries that created duplicate memories.
+const WRITE_TIMEOUT_MS = 30000;
+
+// Warn if non-localhost URL uses HTTP (security risk)
+if (shouldWarnInsecureApiUrl(API_URL, process.env.SHODH_ALLOW_HTTP)) {
+  console.error("[shodh-memory] WARNING: Using HTTP for a non-localhost server is insecure.");
+  console.error("[shodh-memory] Set SHODH_API_URL to an https:// URL, or set SHODH_ALLOW_HTTP=true to suppress this warning.");
+}
 
 // Input validation limits
 const MAX_CONTENT_LENGTH = 100_000; // 100KB max for content fields
@@ -218,6 +231,8 @@ let lastProactiveResponse: string = "";
 let streamSocket: WebSocket | null = null;
 let streamConnecting = false;
 let streamReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let streamReconnectDelay = 1000; // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 60s
+const STREAM_RECONNECT_MAX_DELAY = 60_000;
 
 // Buffer for messages while reconnecting
 const streamBuffer: string[] = [];
@@ -234,16 +249,21 @@ async function connectStream(): Promise<void> {
   streamHandshakeComplete = false;
 
   try {
-    // Note: /api/stream requires X-API-Key header for authentication
-    // Bun supports headers via: new WebSocket(url, { headers: {...} })
-    streamSocket = new WebSocket(WS_URL, {
+    // Auth: Bun supports headers in WebSocket constructor, but Node.js does not.
+    // Pass API key as query parameter for cross-runtime compatibility.
+    // Server accepts both X-API-Key header and ?api_key= query parameter.
+    const wsUrlWithAuth = WS_URL + (WS_URL.includes("?") ? "&" : "?") + "api_key=" + encodeURIComponent(API_KEY);
+
+    // Also try passing header for Bun (ignored by Node.js WebSocket)
+    streamSocket = new WebSocket(wsUrlWithAuth, {
       headers: {
         "X-API-Key": API_KEY
       }
-    });
+    } as any);
 
     streamSocket.onopen = () => {
       streamConnecting = false;
+      streamReconnectDelay = 1000; // Reset backoff on successful connection
       console.error("[Stream] WebSocket connected to", WS_URL);
       // Send handshake first - server expects StreamHandshake as first message
       const handshake = JSON.stringify({
@@ -289,13 +309,15 @@ async function connectStream(): Promise<void> {
       streamSocket = null;
       streamConnecting = false;
       streamHandshakeComplete = false;
-      // Reconnect after delay
+      // Reconnect after delay with exponential backoff
       if (STREAM_ENABLED && !streamReconnectTimer) {
+        const delay = streamReconnectDelay;
+        streamReconnectDelay = nextReconnectDelay(streamReconnectDelay, STREAM_RECONNECT_MAX_DELAY);
         streamReconnectTimer = setTimeout(() => {
           streamReconnectTimer = null;
-          console.error("[Stream] Attempting reconnect...");
+          console.error(`[Stream] Attempting reconnect (next delay: ${streamReconnectDelay}ms)...`);
           connectStream().catch((e) => console.error("[Stream] Reconnect failed:", e));
-        }, 5000);
+        }, delay);
       }
     };
 
@@ -475,7 +497,8 @@ async function apiCall<T>(
   for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      const timeout = method === "GET" ? REQUEST_TIMEOUT_MS : WRITE_TIMEOUT_MS;
+      const timeoutId = setTimeout(() => controller.abort(), timeout);
 
       const options: RequestInit = {
         method,
@@ -487,7 +510,11 @@ async function apiCall<T>(
       };
 
       if (body) {
-        options.body = JSON.stringify(body);
+        const bodyValidation = serializeAndValidateBody(body, MAX_CONTENT_LENGTH);
+        if (!bodyValidation.ok) {
+          throw new Error(bodyValidation.error);
+        }
+        options.body = bodyValidation.serialized;
       }
 
       const response = await fetch(`${API_URL}${endpoint}`, options);
@@ -547,7 +574,7 @@ async function isServerAvailable(): Promise<boolean> {
 const server = new Server(
   {
     name: "shodh-memory",
-    version: "0.1.61",
+    version: "0.1.90",
   },
   {
     capabilities: {
@@ -1466,7 +1493,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (tags.length > 0) {
           response += ` │ Tags: ${tags.join(', ')}`;
         }
-        response += `\nID: ${result.id.slice(0, 8)}...`;
+        response += `\nID: ${result.id}`;
         if (PROJECT_NAME) {
           response += ` │ Project: ${PROJECT_NAME}`;
         }
@@ -1598,7 +1625,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
             response += `• ${matchBar} ${score}% │ ${timeStr}\n`;
             response += `  ${content.slice(0, 200)}${content.length > 200 ? '...' : ''}\n`;
-            response += `  ┗━ ${getType(m)}${m.tier ? ` │ ${m.tier}` : ''} │ ${m.id.slice(0, 8)}...\n`;
+            response += `  ┗━ ${getType(m)}${m.tier ? ` │ ${m.tier}` : ''} │ ${m.id}\n`;
             if (i < memories.length - 1) response += `\n`;
           }
         }
@@ -1638,7 +1665,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Format lineage edges connecting recalled memories
         if (lineage.length > 0) {
           // Build short ID lookup from recalled memories
-          const idShort = (id: string) => id.slice(0, 8);
+          const idShort = (id: string) => id;
           const idToContent = new Map<string, string>();
           for (const m of memories) {
             idToContent.set(m.id, getContent(m).slice(0, 40));
@@ -1825,7 +1852,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }[getType(m)] || '📦';
 
           response += `${String(i + 1).padStart(2)}. ${typeIcon} ${content.slice(0, 150)}${content.length > 150 ? '...' : ''}\n`;
-          response += `    ┗━ ${getType(m)}${m.tier ? ` │ ${m.tier}` : ''} │ ${m.id.slice(0, 8)}...\n`;
+          response += `    ┗━ ${getType(m)}${m.tier ? ` │ ${m.tier}` : ''} │ ${m.id}\n`;
         }
 
         return {
@@ -1840,7 +1867,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         let response = `🐘 Memory Deleted\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-        response += `✓ Removed: ${id.slice(0, 8)}...`;
+        response += `✓ Removed: ${id}`;
 
         return {
           content: [{ type: "text", text: response }],
@@ -2020,7 +2047,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           response += `Checksum: ${b.checksum.slice(0, 16)}...\n`;
           response += `Created: ${new Date(b.created_at).toLocaleString()}\n`;
         } else {
-          response += `✗ Failed: ${result.message}\n`;
+          response += `✗ Failed: ${result.message || "Unknown backup creation error"}\n`;
         }
 
         return {
@@ -2095,7 +2122,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
         response += `${statusIcon} Backup #${backup_id}: ${statusText}\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-        response += result.message;
+        response += result.message || "No verification details provided";
 
         return {
           content: [{ type: "text", text: response }],
@@ -2152,9 +2179,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (result.restored_stores.length > 0) {
             response += `Restored stores: ${result.restored_stores.join(", ")}\n`;
           }
-          response += `\n⚠️ ${result.message}`;
+          response += `\n⚠️ ${result.message || "Restore completed with no additional details"}`;
         } else {
-          response += `✗ Restore failed: ${result.message}`;
+          response += `✗ Restore failed: ${result.message || "Unknown restore error"}`;
         }
 
         return {
@@ -2324,7 +2351,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             for (const r of uniqueReminders) {
               const icon = r.overdue_seconds && r.overdue_seconds > 0 ? "⏰" : "📌";
               const contentText = r.content.slice(0, 38);
-              reminderBlock += `┃  ${icon} ${contentText.padEnd(44)} [${r.id.slice(0,8)}] ┃\n`;
+              reminderBlock += `┃  ${icon} ${contentText.padEnd(44)} [${r.id}] ┃\n`;
 
               if (r.overdue_seconds && r.overdue_seconds > 0) {
                 const mins = Math.round(r.overdue_seconds / 60);
@@ -2427,7 +2454,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Ingestion confirmation
         const ingestNote = result.ingested_memory_id
-          ? `\n[Context ingested: ${result.ingested_memory_id.slice(0, 8)}]`
+          ? `\n[Context ingested: ${result.ingested_memory_id}]`
           : '';
 
         // Summary counts
@@ -2704,7 +2731,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         let response = `🐘 Reminder Set\n`;
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-        response += `ID: ${result.id.slice(0, 8)}...\n`;
+        response += `ID: ${result.id}\n`;
         response += `Content: ${content}\n`;
         response += `Trigger: ${trigger_type}`;
         if (trigger_type === "time" && result.due_at) {
@@ -2762,7 +2789,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const icon = r.overdue_seconds && r.overdue_seconds > 0 ? "⏰" : "📌";
           const statusBadge = r.status === "triggered" ? " [TRIGGERED]" : "";
           response += `${icon} ${r.content.slice(0, 50)}${r.content.length > 50 ? "..." : ""}${statusBadge}\n`;
-          response += `   Type: ${r.trigger_type} | Priority: ${'★'.repeat(r.priority)} | ID: ${r.id.slice(0, 8)}...\n`;
+          response += `   Type: ${r.trigger_type} | Priority: ${'★'.repeat(r.priority)} | ID: ${r.id}\n`;
           if (r.due_at) {
             response += `   Due: ${new Date(r.due_at).toLocaleString()}\n`;
           }
@@ -2795,8 +2822,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: result.success
-                ? `✓ Reminder dismissed: ${reminder_id.slice(0, 8)}...`
-                : `⚠️ ${result.message}`,
+                ? `✓ Reminder dismissed: ${reminder_id}`
+                : `⚠️ ${result.message || "No message returned"}`,
             },
           ],
         };
@@ -3297,10 +3324,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // Hierarchy info
         if (memory.parent_id) {
-          response += `Parent: ${memory.parent_id.slice(0, 8)}...\n`;
+          response += `Parent: ${memory.parent_id}\n`;
         }
         if (memory.children_count > 0) {
-          response += `Children: ${memory.children_count} (${memory.children_ids.map(id => id.slice(0, 8)).join(", ")})\n`;
+          response += `Children: ${memory.children_count} (${memory.children_ids.join(", ")})\n`;
         }
 
         response += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
@@ -4038,16 +4065,16 @@ function getBinaryPath(): string | null {
     fallbackName = "shodh-memory-server";
   }
 
-  // Try wrapper first (includes ONNX Runtime setup)
-  const wrapperPath = path.join(binDir, wrapperName);
-  if (fs.existsSync(wrapperPath)) {
-    return wrapperPath;
-  }
-
-  // Fallback to direct binary (requires system ONNX Runtime)
+  // Prefer direct binary (avoids spawn EINVAL with .bat + detached on Windows)
   const binaryPath = path.join(binDir, fallbackName);
   if (fs.existsSync(binaryPath)) {
     return binaryPath;
+  }
+
+  // Fallback to wrapper script (includes ONNX Runtime setup)
+  const wrapperPath = path.join(binDir, wrapperName);
+  if (fs.existsSync(wrapperPath)) {
+    return wrapperPath;
   }
 
   return null;
@@ -4128,6 +4155,15 @@ async function ensureServerRunning(): Promise<void> {
     return;
   }
 
+  // Validate that the resolved binary is within the expected bin directory
+  const expectedBinDir = fs.realpathSync(path.join(__dirname, "..", "bin"));
+  const resolvedBinary = fs.realpathSync(binaryPath);
+  if (!resolvedBinary.startsWith(expectedBinDir + path.sep) && resolvedBinary !== expectedBinDir) {
+    console.error(`[shodh-memory] WARNING: Binary path resolves outside expected directory: ${resolvedBinary}`);
+    console.error(`[shodh-memory] Expected: ${expectedBinDir}`);
+    return;
+  }
+
   console.error("[shodh-memory] Starting backend server...");
 
   // Build a clean environment for the server process.
@@ -4159,11 +4195,13 @@ async function ensureServerRunning(): Promise<void> {
   // Always pass the API key for auth
   serverEnv["SHODH_DEV_API_KEY"] = API_KEY;
 
-  // Spawn the server process
+  // Spawn the server process (.bat files need shell: true on Windows)
+  const isBat = binaryPath.endsWith(".bat");
   serverProcess = spawn(binaryPath, [], {
     detached: true,
     stdio: "ignore",
     env: serverEnv,
+    ...(isBat && { shell: true }),
   });
 
   serverProcess.unref();
@@ -4228,7 +4266,7 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Shodh-Memory MCP server v0.1.81 running");
+  console.error("Shodh-Memory MCP server v0.1.90 running");
   console.error(`Connecting to: ${API_URL}`);
   console.error(`User ID: ${USER_ID}`);
   console.error(`Streaming: ${STREAM_ENABLED ? "enabled" : "disabled"}`);

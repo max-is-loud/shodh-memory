@@ -552,6 +552,35 @@ pub const FACT_NEGATION_MARKERS: &[&str] = &[
 // DEFAULT CONFIGURATION VALUES
 // =============================================================================
 
+/// Total RocksDB block cache capacity shared across ALL DB instances (bytes).
+///
+/// A single LRU cache is shared by every per-user MemoryStorage, per-user
+/// GraphMemory, and the shared global DB. Index blocks, filter blocks, data
+/// blocks, and memtable charges all draw from this pool.
+///
+/// Justification:
+/// - 256MB provides excellent hit rates for typical workloads (1-100 users)
+/// - Prevents unbounded C++ heap growth from per-user isolated caches
+/// - Follows industry standard: YugabyteDB, Apache Flink, Kafka Streams all
+///   share a single block cache across RocksDB instances
+///
+/// Reference: https://github.com/facebook/rocksdb/wiki/Block-Cache
+/// "Set the same Cache object on all the table_options for all the Column
+/// Families of all DB's managed by the process."
+pub const ROCKSDB_SHARED_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Per-DB write buffer size for MemoryStorage (bytes).
+///
+/// Reduced from 32MB to 8MB because total memtable memory is now bounded
+/// by the shared cache. Smaller individual buffers means more users can
+/// coexist before triggering flushes.
+pub const ROCKSDB_MEMORY_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// Per-DB write buffer size for GraphMemory (bytes).
+///
+/// Graph entries are small KV pairs (entities, edges), so 4MB is sufficient.
+pub const ROCKSDB_GRAPH_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
 /// Default working memory capacity (entries)
 pub const DEFAULT_WORKING_MEMORY_SIZE: usize = 100;
 
@@ -1050,21 +1079,23 @@ pub const LTP_WEEKLY_DECAY_FACTOR: f32 = 0.3;
 ///
 /// L2 edges store this many recent activation timestamps.
 ///
-/// Justification:
-/// - 20 timestamps covers ~2 weeks of daily use
-/// - Sufficient for weekly pattern detection
-/// - Memory: 20 × 8 bytes = 160 bytes per L2 edge
-pub const ACTIVATION_HISTORY_L2_CAPACITY: usize = 20;
+/// Calibration:
+/// - 30 timestamps = 1 per day × 30-day episodic lifecycle (L2_MAX_AGE_DAYS)
+/// - Perfectly sized: no wasted capacity, full lifecycle coverage
+/// - Sufficient for weekly pattern detection within the episodic window
+/// - Memory: 30 × 8 bytes = 240 bytes per L2 edge
+pub const ACTIVATION_HISTORY_L2_CAPACITY: usize = 30;
 
 /// Activation history capacity for L3 (Semantic) tier edges
 ///
 /// L3 edges store this many recent activation timestamps.
 ///
-/// Justification:
-/// - 50 timestamps covers ~2 months of regular use
-/// - Sufficient for monthly pattern detection and temporal queries
-/// - Memory: 50 × 8 bytes = 400 bytes per L3 edge
-pub const ACTIVATION_HISTORY_L3_CAPACITY: usize = 50;
+/// Calibration:
+/// - 200 timestamps ≈ 15 months at 3×/week activation frequency
+/// - L3 edges are near-permanent (L3_DECAY_PER_MONTH = 0.02), so deep history is warranted
+/// - Sufficient for monthly and seasonal pattern detection on long-lived semantic edges
+/// - Memory: 200 × 8 bytes = 1600 bytes per L3 edge
+pub const ACTIVATION_HISTORY_L3_CAPACITY: usize = 200;
 
 // =============================================================================
 // UNIFIED LTP READINESS MODEL (PIPE-5)

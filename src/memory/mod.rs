@@ -49,8 +49,8 @@ use crate::metrics::{
 use crate::constants::{
     DEFAULT_COMPRESSION_AGE_DAYS, DEFAULT_IMPORTANCE_THRESHOLD, DEFAULT_MAX_HEAP_PER_USER_MB,
     DEFAULT_SESSION_MEMORY_SIZE_MB, DEFAULT_WORKING_MEMORY_SIZE, EDGE_SEMANTIC_WEIGHT_FLOOR,
-    ESTIMATED_BYTES_PER_MEMORY, HEBBIAN_BOOST_HELPFUL, HEBBIAN_DECAY_MISLEADING,
-    POTENTIATION_ACCESS_THRESHOLD, POTENTIATION_MAINTENANCE_BOOST, TIER_PROMOTION_SESSION_AGE_SECS,
+    HEBBIAN_BOOST_HELPFUL, HEBBIAN_DECAY_MISLEADING, POTENTIATION_ACCESS_THRESHOLD,
+    POTENTIATION_MAINTENANCE_BOOST, TIER_PROMOTION_SESSION_AGE_SECS,
     TIER_PROMOTION_SESSION_IMPORTANCE, TIER_PROMOTION_WORKING_AGE_SECS,
     TIER_PROMOTION_WORKING_IMPORTANCE,
 };
@@ -279,11 +279,15 @@ fn build_ner_lookup(
 }
 
 impl MemorySystem {
-    /// Create a new memory system
-    pub fn new(config: MemoryConfig) -> Result<Self> {
+    /// Create a new memory system.
+    ///
+    /// If `shared_cache` is provided, all per-user RocksDB instances share the
+    /// same LRU block cache (multi-tenant server mode). Pass `None` for
+    /// standalone / test use — each DB gets a small local cache.
+    pub fn new(config: MemoryConfig, shared_cache: Option<&rocksdb::Cache>) -> Result<Self> {
         let storage_path = config.storage_path.clone();
         let storage = Arc::new(
-            MemoryStorage::new(&storage_path)
+            MemoryStorage::new(&storage_path, shared_cache)
                 .with_context(|| format!("Failed to open storage at {:?}", storage_path))?,
         );
 
@@ -583,7 +587,6 @@ impl MemorySystem {
         mut experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<MemoryId> {
-        self.check_resource_limits()?;
         let importance = self.calculate_importance(&experience);
 
         // Generate embedding if not provided
@@ -629,8 +632,20 @@ impl MemorySystem {
         mut experience: Experience,
         created_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<MemoryId> {
-        // CRITICAL: Check resource limits before recording to prevent OOM
-        self.check_resource_limits()?;
+        // IDEMPOTENCY (issue #109): Check content hash index before creating a new memory.
+        // If identical content already exists, return the existing MemoryId instead of
+        // creating a duplicate. Catches all duplication paths: timeout retries, auto_ingest,
+        // and manual re-remembers. O(1) RocksDB index lookup.
+        if let Some(existing_id) = self
+            .long_term_memory
+            .get_by_content_hash(&experience.content)
+        {
+            tracing::debug!(
+                existing_id = %existing_id.0,
+                "Content dedup: returning existing memory (identical content already stored)"
+            );
+            return Ok(existing_id);
+        }
 
         let memory_id = MemoryId(Uuid::new_v4());
 
@@ -963,8 +978,17 @@ impl MemorySystem {
         agent_id: Option<String>,
         run_id: Option<String>,
     ) -> Result<MemoryId> {
-        // CRITICAL: Check resource limits before recording to prevent OOM
-        self.check_resource_limits()?;
+        // IDEMPOTENCY (issue #109): Content hash dedup (same as remember())
+        if let Some(existing_id) = self
+            .long_term_memory
+            .get_by_content_hash(&experience.content)
+        {
+            tracing::debug!(
+                existing_id = %existing_id.0,
+                "Content dedup: returning existing memory (identical content already stored)"
+            );
+            return Ok(existing_id);
+        }
 
         let memory_id = MemoryId(Uuid::new_v4());
 
@@ -1693,6 +1717,10 @@ impl MemorySystem {
         // ===========================================================================
         // LAYER 2: GRAPH EXPANSION (Knowledge Graph Traversal)
         // ===========================================================================
+        let use_graph = matches!(
+            query.retrieval_mode,
+            RetrievalMode::Hybrid | RetrievalMode::Associative | RetrievalMode::Causal
+        );
         let (
             graph_results,
             graph_density,
@@ -1708,7 +1736,7 @@ impl MemorySystem {
             Vec<(String, f32)>,
             f32, // Keyword discriminativeness for dynamic BM25/vector weight adjustment
         ) = {
-            if let Some(graph) = &self.graph_memory {
+            if let Some(graph) = self.graph_memory.as_ref().filter(|_| use_graph) {
                 let g = graph.read();
                 // Extract IC weights for BM25 term boosting
                 let weights = query_analysis.to_ic_weights();
@@ -1891,7 +1919,13 @@ impl MemorySystem {
                 }
                 (r, d, entity_count, weights, phrases, disc)
             } else {
-                // No graph memory - still analyze query for IC weights and phrase boosts
+                if !use_graph && self.graph_memory.is_some() {
+                    tracing::debug!(
+                        "Layer 2: SKIPPED (retrieval_mode={:?})",
+                        query.retrieval_mode
+                    );
+                }
+                // No graph traversal - still analyze query for IC weights and phrase boosts
                 let (disc, _) = query_analysis.keyword_discriminativeness();
                 (
                     Vec::new(),
@@ -4822,30 +4856,6 @@ impl MemorySystem {
         }
     }
 
-    /// Check resource limits to prevent OOM from single user
-    ///
-    /// Uses ESTIMATED_BYTES_PER_MEMORY constant for size estimation.
-    /// See constants.rs for justification of the estimate.
-    pub fn check_resource_limits(&self) -> Result<(), crate::errors::AppError> {
-        // Get current memory counts from stats
-        let stats = self.stats.read();
-        let total_memories = stats.working_memory_count + stats.session_memory_count;
-
-        // Estimate size using documented constant (see constants.rs for breakdown)
-        let estimated_size_bytes = total_memories * ESTIMATED_BYTES_PER_MEMORY;
-        let estimated_size_mb = estimated_size_bytes / (1024 * 1024);
-
-        if estimated_size_mb > self.config.max_heap_per_user_mb {
-            return Err(crate::errors::AppError::ResourceLimit {
-                resource: "user_memory".to_string(),
-                current: estimated_size_mb,
-                limit: self.config.max_heap_per_user_mb,
-            });
-        }
-
-        Ok(())
-    }
-
     // =========================================================================
     // OUTCOME FEEDBACK SYSTEM - Hebbian "Fire Together, Wire Together"
     // =========================================================================
@@ -5238,9 +5248,6 @@ impl MemorySystem {
         changed_by: Option<String>,
         change_reason: Option<String>,
     ) -> Result<(MemoryId, bool)> {
-        // Check resource limits
-        self.check_resource_limits()?;
-
         // Try to find existing memory with this external_id
         if let Some(mut existing) = self.long_term_memory.find_by_external_id(&external_id)? {
             // === UPDATE PATH ===

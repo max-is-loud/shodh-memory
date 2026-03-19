@@ -14,6 +14,7 @@
   <a href="https://pypi.org/project/shodh-memory/"><img src="https://img.shields.io/pypi/v/shodh-memory.svg" alt="PyPI"></a>
   <a href="https://hub.docker.com/r/varunshodh/shodh-memory"><img src="https://img.shields.io/docker/pulls/varunshodh/shodh-memory.svg?logo=docker" alt="Docker"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
+  <a href="https://discord.gg/HrpzXqTtEp"><img src="https://img.shields.io/discord/1471830549818642432?logo=discord&label=Discord&color=5865F2" alt="Discord"></a>
 </p>
 
 ---
@@ -37,6 +38,19 @@ Shodh-Memory fixes this. It's persistent memory that actually learns — memorie
 Every other memory system delegates intelligence to LLM API calls — that's why they're slow, expensive, and can't work offline. Shodh uses algorithmic intelligence: local embeddings, mathematical decay, learned associations. No LLM in the loop.
 
 ## Get Started
+
+### Unified CLI
+
+```bash
+# Download from GitHub Releases (or brew tap varun29ankuS/shodh-memory && brew install shodh-memory)
+shodh init       # First-time setup — creates config, generates API key, downloads AI model
+shodh server     # Start the memory server on :3030
+shodh tui        # Launch the TUI dashboard
+shodh status     # Check server health
+shodh doctor     # Diagnose issues
+```
+
+One binary, all functionality. No Docker, no API keys, no external dependencies.
 
 ### Claude Code (one command)
 
@@ -132,31 +146,32 @@ This is based on [Cowan's working memory model](https://doi.org/10.1177/09637214
 
 | Operation | Latency |
 |-----------|---------|
-| Store memory | 55-60ms |
+| Store memory (API response) | <200ms |
+| Store memory (core) | 55-60ms |
 | Semantic search | 34-58ms |
 | Tag search | ~1ms |
 | Entity lookup | 763ns |
 | Graph traversal (3-hop) | 30µs |
 
-Single 17MB binary. No GPU required. Runs on a $5 VPS.
+Single binary. No GPU required. Content-hash dedup ensures identical memories are never stored twice.
 
 ## TUI Dashboard
 
 ```bash
-shodh-tui
+shodh tui
 ```
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/dashboard.jpg" width="700" alt="Shodh Dashboard">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/recall.png" width="700" alt="Shodh Recall">
 </p>
 
-<p align="center"><i>Real-time activity feed, memory tiers, and detailed inspection</i></p>
+<p align="center"><i>Semantic recall with hybrid search — relevance scores, memory tiers, and activity feed</i></p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/graph-map.jpg" width="700" alt="Shodh Graph Map">
+  <img src="https://raw.githubusercontent.com/varun29ankuS/shodh-memory/main/assets/projects-todos.jpg" width="700" alt="Shodh Projects & Todos">
 </p>
 
-<p align="center"><i>Knowledge graph — entity connections strengthened through use</i></p>
+<p align="center"><i>GTD task management — projects, todos, comments, and causal lineage</i></p>
 
 ## 47 MCP Tools
 
