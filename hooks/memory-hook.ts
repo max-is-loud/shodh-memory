@@ -12,6 +12,41 @@ const SHODH_API_URL = process.env.SHODH_API_URL || "http://127.0.0.1:3030";
 const SHODH_API_KEY = process.env.SHODH_API_KEY || "sk-shodh-dev-local-testing-key";
 const SHODH_USER_ID = process.env.SHODH_USER_ID || "claude-code";
 
+let hookProject: string | undefined;
+
+function detectProjectFromCwd(cwd?: string): string | undefined {
+  if (!cwd) return undefined;
+  try {
+    const fs = require("fs");
+    const path = require("path");
+
+    // Find .git — could be a directory (normal) or file (worktree)
+    let gitDir = path.join(cwd, ".git");
+    try {
+      const stat = fs.statSync(gitDir);
+      if (!stat.isDirectory()) {
+        const content = fs.readFileSync(gitDir, "utf-8").trim();
+        const match = content.match(/^gitdir:\s*(.+)/);
+        if (match) {
+          gitDir = path.resolve(cwd, match[1], "..", "..");
+        }
+      }
+    } catch { /* .git doesn't exist */ }
+
+    const configPath = path.join(gitDir, "config");
+    const configContent = fs.readFileSync(configPath, "utf-8");
+    const originMatch = configContent.match(/\[remote "origin"\][^\[]*?url\s*=\s*(.+)/);
+    if (originMatch) {
+      const remoteUrl = originMatch[1].trim();
+      const repoMatch = remoteUrl.match(/[/:]([^/:]+?)(?:\.git)?$/);
+      if (repoMatch) return repoMatch[1];
+    }
+  } catch { /* git detection failed */ }
+
+  // Fallback: directory basename
+  return cwd.split(/[/\\]/).pop() || undefined;
+}
+
 interface HookInput {
   hook_event_name: string;
   session_id?: string;
@@ -135,7 +170,7 @@ export function buildPreToolContext(toolName: string, toolInput: Record<string, 
   return `About to use ${toolName}`;
 }
 
-async function surfaceProactiveContext(context: string, maxResults = 3, autoIngest = false): Promise<string | null> {
+async function surfaceProactiveContext(context: string, maxResults = 3, autoIngest = false, project?: string): Promise<string | null> {
   const response = (await callBrain("/api/proactive_context", {
     user_id: SHODH_USER_ID,
     context,
@@ -144,6 +179,7 @@ async function surfaceProactiveContext(context: string, maxResults = 3, autoInge
     entity_match_weight: 0.3,
     recency_weight: 0.2,
     auto_ingest: autoIngest,
+    ...(project && { project }),
   })) as ProactiveContextResponse | null;
 
   if (!response) return null;
@@ -187,7 +223,7 @@ async function handleSessionStart(): Promise<void> {
   const projectName = projectDir.split(/[/\\]/).pop() || "unknown";
 
   const context = `Starting session in project: ${projectName}`;
-  const memoryContext = await surfaceProactiveContext(context, 5);
+  const memoryContext = await surfaceProactiveContext(context, 5, false, hookProject);
 
   if (memoryContext) {
     console.error(`[shodh] Session context loaded`);
@@ -210,7 +246,7 @@ async function handleUserPrompt(input: HookInput): Promise<void> {
   if (!prompt || prompt.length < 10) return;
 
   // Single call: surface memories AND ingest the prompt in one pipeline pass
-  const memoryContext = await surfaceProactiveContext(prompt.slice(0, 1000), 3, true);
+  const memoryContext = await surfaceProactiveContext(prompt.slice(0, 1000), 3, true, hookProject);
 
   if (memoryContext) {
     console.log(
@@ -232,7 +268,7 @@ async function handlePreToolUse(input: HookInput): Promise<void> {
   const context = buildPreToolContext(toolName, toolInput);
 
   // Surface relevant context BEFORE the tool runs
-  const memoryContext = await surfaceProactiveContext(context, 2);
+  const memoryContext = await surfaceProactiveContext(context, 2, false, hookProject);
 
   if (memoryContext) {
     console.log(
@@ -268,6 +304,7 @@ async function handlePostToolUse(input: HookInput): Promise<void> {
         content: `Modified file: ${filePath}`,
         memory_type: "FileAccess",
         tags: [`tool:${toolName}`, `file:${filePath.split(/[/\\]/).pop()}`],
+        ...(hookProject && { project: hookProject }),
       });
     }
   } else if (toolName === "Bash" && toolOutput) {
@@ -280,12 +317,15 @@ async function handlePostToolUse(input: HookInput): Promise<void> {
         content: `Command failed: ${command?.slice(0, 100)} → ${toolOutput.slice(0, 200)}`,
         memory_type: "Error",
         tags: ["tool:Bash", "error"],
+        ...(hookProject && { project: hookProject }),
       });
 
       // Surface past errors for this type of command
       const memoryContext = await surfaceProactiveContext(
         `Error with command: ${command?.slice(0, 100)}`,
-        2
+        2,
+        false,
+        hookProject
       );
       if (memoryContext) {
         console.log(
@@ -304,7 +344,9 @@ async function handlePostToolUse(input: HookInput): Promise<void> {
       // Surface what we know about this file
       const memoryContext = await surfaceProactiveContext(
         `Reading file: ${filePath}`,
-        2
+        2,
+        false,
+        hookProject
       );
       if (memoryContext) {
         console.log(
@@ -427,6 +469,7 @@ async function handlePostToolUseTask(input: HookInput): Promise<void> {
         content: `Task agent completed: ${resultText.slice(0, 300)}`,
         memory_type: "Task",
         tags: ["subagent:task", "source:hook"],
+        ...(hookProject && { project: hookProject }),
       });
     }
     return;
@@ -466,12 +509,15 @@ async function handlePostToolUseTask(input: HookInput): Promise<void> {
     content: `Orchestration task ${todoShortId} completed: ${resultText.slice(0, 200)}`,
     memory_type: "Task",
     tags: ["orchestration", `todo:${todoShortId}`, "source:hook"],
+    ...(hookProject && { project: hookProject }),
   });
 
   // 5. Surface orchestration status
   const memoryContext = await surfaceProactiveContext(
     `Orchestration: task ${todoShortId} completed, checking for unblocked work`,
-    2
+    2,
+    false,
+    hookProject
   );
   if (memoryContext) {
     console.log(
@@ -501,6 +547,7 @@ async function handleSubagentStop(input: HookInput): Promise<void> {
     content,
     memory_type: "Task",
     tags: [`subagent:${agentType}`, "source:hook"],
+    ...(hookProject && { project: hookProject }),
   });
 }
 
@@ -520,6 +567,8 @@ async function main(): Promise<void> {
     const eventType = process.argv[2];
     input = { hook_event_name: eventType || "SessionStart" };
   }
+
+  hookProject = detectProjectFromCwd(input.cwd);
 
   const eventName = input.hook_event_name;
 
